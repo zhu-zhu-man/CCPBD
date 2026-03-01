@@ -1,56 +1,81 @@
-#python3.7    UTF-8     PyCharm    time：2021.9.26.15.11
-
+# 2main2.py 标签处理（防粘连 + 多模态标签）
+import os
+import argparse
 import numpy as np
-import time
-import Crop_image
+from osgeo import gdal, ogr, osr
+from utils.io_utils import rasterize_vector, save_geotiff
+from creat_edge_label import generate_edge_label
+from creat_gaussian_distance_map import generate_gaussian_distance_map
 
+def face_minus_edge_rasterize(label_shp, boundary_shp, output_mask, fill_value=255):
+    """ 面减线：生成防粘连掩膜 """
+    # 1. 面栅格化
+    face_raster = rasterize_vector(label_shp, boundary_shp, burn_value=fill_value)
+    
+    # 2. 提取边界线
+    line_shp = label_shp.replace('.shp', '_lines.shp')
+    extract_polyline(label_shp, line_shp)
+    
+    # 3. 线栅格化
+    edge_raster = rasterize_vector(line_shp, boundary_shp, burn_value=fill_value)
+    
+    # 4. 面减线
+    final_mask = np.where((face_raster == fill_value) & (edge_raster != fill_value), fill_value, 0)
+    return final_mask.astype(np.uint8)
 
-# datapath = "D:\DeepLeaningDatas"# 给到包含所有数据的文件夹，即：上层文件夹
+def extract_polyline(polygon_shp, line_shp):
+    """ 将面矢量转为线矢量 """
+    driver = ogr.GetDriverByName('ESRI Shapefile')
+    src_ds = ogr.Open(polygon_shp)
+    src_layer = src_ds.GetLayer()
+    
+    dst_ds = driver.CreateDataSource(line_shp)
+    srs = src_layer.GetSpatialRef()
+    dst_layer = dst_ds.CreateLayer('lines', srs, geom_type=ogr.wkbLineString)
+    
+    for feat in src_layer:
+        geom = feat.GetGeometryRef()
+        boundary = geom.GetBoundary()
+        if boundary:
+            out_feat = ogr.Feature(dst_layer.GetLayerDefn())
+            out_feat.SetGeometry(boundary)
+            dst_layer.CreateFeature(out_feat)
+    
+    dst_ds = None
+    src_ds = None
 
-# cutw = 224#切割宽度
-# cuth = 224#切割高度
-# overlap1 = 0.5  #范围是[0-1]
-# overlap2 = 0.5
-# datapath = r"G:\BaiduNetdiskDownload\耕地地块标注20240831"
-datapath = r"G:\BaiduNetdiskDownload\（分省）耕地地块标注（修改后副本）\江西省\坡耕"
-# datapath = r"G:\东三省农田标注\东三省农田标注副本"
-cutw = 512#切割宽度
-cuth = 512#切割高度
-overlap1 = 0.5  #范围是[0-1]
-overlap2 = 0.5
+def main(args):
+    tif_paths = np.load(os.path.join(args.config_path, 'tif_path.npy'))
+    board_paths = np.load(os.path.join(args.config_path, 'board_path.npy'))
+    label_paths = np.load(os.path.join(args.config_path, 'label_path.npy'))
+    output_paths = np.load(os.path.join(args.config_path, 'output_path.npy'))
 
-for ii in range(3): #尝试打开文件
-    try:
-        #house_path = np.load(datapath + '\\house_path.npy')
-        #tif_path = np.load(datapath + '\\tif_path.npy')
-        output_path = np.load(datapath + '\\output_path.npy')
-        #expend_path = np.load(datapath + '\\expend_path.npy')
-        expend_path2 = np.load(datapath + '\\expend_path2.npy')
-        print('打开成功，路径文件读取完成')
-        break
-    except:
-        print('路径文件至少有一个未找到，重新生成二值图像，重新生成路径文件')
-        #print('第%d尝试',(ii+1))
-        #print('重新生成影像的路径文件')
-        #return_and_creat_tif_path.returnpath(datapath)
-        #'这里需要一个函数（讲上面的代码做成一个函数，来调用'
-        if ii == 2:
-            print('已尝试三次，打开路径文件失败，请检查路径或文件')
-        else:
-            time.sleep(1)
+    for i in range(len(tif_paths)):
+        print(f"Processing label {i+1}/{len(tif_paths)}")
+        mask = face_minus_edge_rasterize(
+            label_paths[i], board_paths[i], output_paths[i]
+        )
+        # 保存标准掩膜
+        cv2.imwrite(output_paths[i], mask)
 
-#AA = Crop_image.cutting(cutw ,cuth ,tif_path,expend_path)#切割遥感影像，小块路径返回
-BB = Crop_image.cutting(cutw, cuth, overlap1, overlap2,output_path, expend_path2)  # 切割遥感影像，小块路径返回
-del output_path,expend_path2
-#np.save(datapath + '\\resultAexpend_path.npy',AA)
-np.save(datapath + '\\resultBexpend_path.npy',BB)
+        # 生成边缘标签
+        if args.generate_edge:
+            edge = generate_edge_label(mask, width=args.edge_width)
+            edge_path = output_paths[i].replace('temp_mask', '../edges').replace('.png', '.png')
+            cv2.imwrite(edge_path, edge)
 
+        # 生成高斯距离图
+        if args.generate_distance_map:
+            dist_map = generate_gaussian_distance_map(mask, sigma=args.sigma)
+            dist_path = output_paths[i].replace('temp_mask', '../dist_maps').replace('.png', '.png')
+            cv2.imwrite(dist_path, dist_map)
 
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config_path', type=str, required=True)
+    parser.add_argument('--generate_edge', action='store_true', default=True)
+    parser.add_argument('--edge_width', type=int, default=3)
+    parser.add_argument('--generate_distance_map', action='store_true', default=True)
+    parser.add_argument('--sigma', type=float, default=20.0)
+    args = parser.parse_args()
+    main(args)
